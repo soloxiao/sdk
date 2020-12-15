@@ -16,10 +16,14 @@
 #include "vm/raw_object_fields.h"
 #include "vm/reusable_handles.h"
 #include "vm/visitor.h"
+#include "include/dart_api.h"
+#include "bin/dartutils.h"
+#include "bin/utils.h"
+#include "include/dart_api.h"
 
 namespace dart {
 
-#if !defined(PRODUCT)
+// #if !defined(PRODUCT)
 
 static bool IsUserClass(intptr_t cid) {
   if (cid == kContextCid) return true;
@@ -1183,6 +1187,207 @@ void HeapSnapshotWriter::Write() {
   Flush(true);
 }
 
+uint8_t * HeapSnapshotWriter::Snapshot() {
+  HeapIterationScope iteration(thread());
+
+  WriteBytes("dartheap", 8);  // Magic value.
+  WriteUnsigned(0);           // Flags.
+  WriteUtf8(isolate()->name());
+  Heap* H = thread()->heap();
+
+  {
+    intptr_t used = H->TotalUsedInWords() << kWordSizeLog2;
+    intptr_t capacity = H->TotalCapacityInWords() << kWordSizeLog2;
+    intptr_t external = H->TotalExternalInWords() << kWordSizeLog2;
+    intptr_t image = H->old_space()->ImageInWords() << kWordSizeLog2;
+    WriteUnsigned(used + image);
+    WriteUnsigned(capacity + image);
+    WriteUnsigned(external);
+  }
+
+  {
+    HANDLESCOPE(thread());
+    ClassTable* class_table = isolate()->class_table();
+    class_count_ = class_table->NumCids() - 1;
+
+    Class& cls = Class::Handle();
+    Library& lib = Library::Handle();
+    String& str = String::Handle();
+    Array& fields = Array::Handle();
+    Field& field = Field::Handle();
+
+    WriteUnsigned(class_count_);
+    for (intptr_t cid = 1; cid <= class_count_; cid++) {
+      if (!class_table->HasValidClassAt(cid)) {
+        WriteUnsigned(0);  // Flags
+        WriteUtf8("");     // Name
+        WriteUtf8("");     // Library name
+        WriteUtf8("");     // Library uri
+        WriteUtf8("");     // Reserved
+        WriteUnsigned(0);  // Field count
+      } else {
+        cls = class_table->At(cid);
+        WriteUnsigned(0);  // Flags
+        str = cls.Name();
+        ScrubAndWriteUtf8(const_cast<char*>(str.ToCString()));
+        lib = cls.library();
+        if (lib.IsNull()) {
+          WriteUtf8("");
+          WriteUtf8("");
+        } else {
+          str = lib.name();
+          ScrubAndWriteUtf8(const_cast<char*>(str.ToCString()));
+          str = lib.url();
+          ScrubAndWriteUtf8(const_cast<char*>(str.ToCString()));
+        }
+        WriteUtf8("");  // Reserved
+
+        intptr_t field_count = 0;
+        intptr_t min_offset = kIntptrMax;
+        for (intptr_t j = 0; OffsetsTable::offsets_table[j].class_id != -1;
+             j++) {
+          if (OffsetsTable::offsets_table[j].class_id == cid) {
+            field_count++;
+            intptr_t offset = OffsetsTable::offsets_table[j].offset;
+            min_offset = Utils::Minimum(min_offset, offset);
+          }
+        }
+        if (cls.is_finalized()) {
+          do {
+            fields = cls.fields();
+            if (!fields.IsNull()) {
+              for (intptr_t i = 0; i < fields.Length(); i++) {
+                field ^= fields.At(i);
+                if (field.is_instance()) {
+                  field_count++;
+                }
+              }
+            }
+            cls = cls.SuperClass();
+          } while (!cls.IsNull());
+          cls = class_table->At(cid);
+        }
+
+        WriteUnsigned(field_count);
+        for (intptr_t j = 0; OffsetsTable::offsets_table[j].class_id != -1;
+             j++) {
+          if (OffsetsTable::offsets_table[j].class_id == cid) {
+            intptr_t flags = 1;  // Strong.
+            WriteUnsigned(flags);
+            intptr_t offset = OffsetsTable::offsets_table[j].offset;
+            intptr_t index = (offset - min_offset) / kWordSize;
+            ASSERT(index >= 0);
+            WriteUnsigned(index);
+            WriteUtf8(OffsetsTable::offsets_table[j].field_name);
+            WriteUtf8("");  // Reserved
+          }
+        }
+        if (cls.is_finalized()) {
+          do {
+            fields = cls.fields();
+            if (!fields.IsNull()) {
+              for (intptr_t i = 0; i < fields.Length(); i++) {
+                field ^= fields.At(i);
+                if (field.is_instance()) {
+                  intptr_t flags = 1;  // Strong.
+                  WriteUnsigned(flags);
+                  intptr_t index = field.HostOffset() / kWordSize - 1;
+                  ASSERT(index >= 0);
+                  WriteUnsigned(index);
+                  str = field.name();
+                  ScrubAndWriteUtf8(const_cast<char*>(str.ToCString()));
+                  WriteUtf8("");  // Reserved
+                }
+              }
+            }
+            cls = cls.SuperClass();
+          } while (!cls.IsNull());
+          cls = class_table->At(cid);
+        }
+      }
+    }
+  }
+
+  SetupCountingPages();
+
+  {
+    Pass1Visitor visitor(this);
+
+    // Root "object".
+    ++object_count_;
+    isolate()->VisitObjectPointers(&visitor,
+                                   ValidationPolicy::kDontValidateFrames);
+
+    // Heap objects.
+    iteration.IterateVMIsolateObjects(&visitor);
+    iteration.IterateObjects(&visitor);
+
+    // External properties.
+    isolate()->group()->VisitWeakPersistentHandles(&visitor);
+  }
+
+  {
+    Pass2Visitor visitor(this);
+
+    WriteUnsigned(reference_count_);
+    WriteUnsigned(object_count_);
+
+    // Root "object".
+    WriteUnsigned(0);  // cid
+    WriteUnsigned(0);  // shallowSize
+    WriteUnsigned(kNoData);
+    visitor.DoCount();
+    isolate()->VisitObjectPointers(&visitor,
+                                   ValidationPolicy::kDontValidateFrames);
+    visitor.DoWrite();
+    isolate()->VisitObjectPointers(&visitor,
+                                   ValidationPolicy::kDontValidateFrames);
+
+    // Heap objects.
+    visitor.set_discount_sizes(true);
+    iteration.IterateVMIsolateObjects(&visitor);
+    visitor.set_discount_sizes(false);
+    iteration.IterateObjects(&visitor);
+
+    // External properties.
+    WriteUnsigned(external_property_count_);
+    isolate()->group()->VisitWeakPersistentHandles(&visitor);
+  }
+
+  ClearObjectIds();
+   if (size_ == 0 ) {
+    return buffer_;
+  }
+
+  // JSONStream js;
+  // {
+  //   JSONObject jsobj(&js);
+  //   jsobj.AddProperty("jsonrpc", "2.0");
+  //   jsobj.AddProperty("method", "streamNotify");
+  //   {
+  //     JSONObject params(&jsobj, "params");
+  //     params.AddProperty("streamId", Service::heapsnapshot_stream.id());
+  //     {
+  //       JSONObject event(&params, "event");
+  //       event.AddProperty("type", "Event");
+  //       event.AddProperty("kind", "HeapSnapshot");
+  //       event.AddProperty("isolate", thread()->isolate());
+  //       event.AddPropertyTimeMillis("timestamp", OS::GetCurrentTimeMillis());
+  //       event.AddProperty("last", last);
+  //     }
+  //   }
+  // }
+
+  // Service::SendEventWithData(Service::heapsnapshot_stream.id(), "HeapSnapshot",
+  //                            kMetadataReservation, js.buffer()->buffer(),
+  //                            js.buffer()->length(), buffer_, size_);
+  // buffer_ = nullptr;
+  // size_ = 0;
+  // capacity_ = 0;
+
+  return buffer_;
+}
+
 CountObjectsVisitor::CountObjectsVisitor(Thread* thread, intptr_t class_count)
     : ObjectVisitor(),
       HandleVisitor(thread),
@@ -1228,6 +1433,24 @@ void CountObjectsVisitor::VisitHandle(uword addr) {
   }
 }
 
-#endif  // !defined(PRODUCT)
+// #endif  // !defined(PRODUCT)
+
+namespace bin {
+  void FUNCTION_NAME(ObjectSnapshot)(Dart_NativeArguments args) {
+
+    // HeapSnapshotWriter writer(Thread::Current());
+    // intptr_t size = writer.size_;
+    //   uint8_t * ret = writer.Snapshot();
+
+    Dart_SetReturnValue(args, DartUtils::NewDartOSError());
+
+    //   Dart_Handle list = Dart_NewList(2);
+
+      // for(int i = 0; i < ret.count; i++) {
+      //     Dart_ListSetAt(list, 1, Dart_NewInteger(ret[1]));
+      // }
+      // Dart_SetReturnValue(args, Dart_NewListOfTypeFilled() ret);
+  }
+}
 
 }  // namespace dart

@@ -7,6 +7,7 @@
 
 #include <memory>
 
+#include "bin/builtin.h"
 #include "vm/allocation.h"
 #include "vm/dart_api_state.h"
 #include "vm/thread_stack_resource.h"
@@ -185,6 +186,8 @@ class HeapSnapshotWriter : public ThreadStackResource {
   void CountExternalProperty();
 
   void Write();
+  uint8_t * Snapshot();
+  intptr_t size_ = 0;
 
  private:
   static const intptr_t kMetadataReservation = 512;
@@ -198,7 +201,6 @@ class HeapSnapshotWriter : public ThreadStackResource {
   void Flush(bool last = false);
 
   uint8_t* buffer_ = nullptr;
-  intptr_t size_ = 0;
   intptr_t capacity_ = 0;
 
   intptr_t class_count_ = 0;

@@ -187,7 +187,8 @@ namespace bin {
   V(X509_Subject, 1)                                                           \
   V(X509_Issuer, 1)                                                            \
   V(X509_StartValidity, 1)                                                     \
-  V(X509_EndValidity, 1)
+  V(X509_EndValidity, 1)                                                       \
+  V(ObjectSnapshot, 1)                                                     
 
 IO_NATIVE_LIST(DECLARE_FUNCTION);
 
